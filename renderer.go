@@ -7,7 +7,7 @@ import (
 	html_template "html/template"
 	text_template "text/template"
 
-	"github.com/Masterminds/sprig"
+	"github.com/Masterminds/sprig/v3"
 )
 
 // RenderType is an "enum" for which type of renderer to use.
@@ -79,6 +79,7 @@ var funcMap = map[string]interface{}{
 	"para":   ParaFilter,
 	"nobr":   NoBrFilter,
 	"anchor": AnchorFilter,
+	"md":     MDFilter,
 }
 
 // Processor is an interface that is satisfied by all built-in processors (text, html, and json).
@@ -90,10 +91,12 @@ type Processor interface {
 // supplying a non-empty string as the last parameter.
 //
 // Example: generating an HTML template (assuming you've got a Template object)
-//     data, err := RenderTemplate(RenderTypeHTML, &template, "")
+//
+//	data, err := RenderTemplate(RenderTypeHTML, &template, "")
 //
 // Example: generating a custom template (assuming you've got a Template object)
-//     data, err := RenderTemplate(RenderTypeHTML, &template, "{{range .Files}}{{.Name}}{{end}}")
+//
+//	data, err := RenderTemplate(RenderTypeHTML, &template, "{{range .Files}}{{.Name}}{{end}}")
 func RenderTemplate(kind RenderType, template *Template, inputTemplate string) ([]byte, error) {
 	if inputTemplate != "" {
 		processor := &textRenderer{inputTemplate}
@@ -113,7 +116,14 @@ type textRenderer struct {
 }
 
 func (mr *textRenderer) Apply(template *Template) ([]byte, error) {
-	tmpl, err := text_template.New("Text Template").Funcs(funcMap).Funcs(sprig.TxtFuncMap()).Parse(mr.inputTemplate)
+	tmpl, err := text_template.New("Text Template").
+		Funcs(funcMap).
+		Funcs(sprig.TxtFuncMap()).
+		Funcs(map[string]any{
+			"isLink": IsLinkFn(template),
+			"link":   LinkFn(template),
+		}).
+		Parse(mr.inputTemplate)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +141,14 @@ type htmlRenderer struct {
 }
 
 func (mr *htmlRenderer) Apply(template *Template) ([]byte, error) {
-	tmpl, err := html_template.New("Text Template").Funcs(funcMap).Funcs(sprig.HtmlFuncMap()).Parse(mr.inputTemplate)
+	tmpl, err := html_template.New("Text Template").
+		Funcs(funcMap).
+		Funcs(sprig.HtmlFuncMap()).
+		Funcs(map[string]any{
+			"isLink": IsLinkFn(template),
+			"link":   LinkFn(template),
+		}).
+		Parse(mr.inputTemplate)
 	if err != nil {
 		return nil, err
 	}

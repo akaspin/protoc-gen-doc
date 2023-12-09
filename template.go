@@ -3,6 +3,7 @@ package gendoc
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -18,11 +19,17 @@ type Template struct {
 	Files []*File `json:"files"`
 	// Details about the scalar values and their respective types in supported languages.
 	Scalars []*ScalarValue `json:"scalarValueTypes"`
+
+	Packages []*Package
+
+	links map[string]*Link
 }
 
 // NewTemplate creates a Template object from a set of descriptors.
 func NewTemplate(descs []*protokit.FileDescriptor) *Template {
 	files := make([]*File, 0, len(descs))
+	packagesByName := map[string]*Package{}
+	messagesByName := map[string]*Message{}
 
 	for _, f := range descs {
 		file := &File{
@@ -38,10 +45,23 @@ func NewTemplate(descs []*protokit.FileDescriptor) *Template {
 			Messages:      make(orderedMessages, 0, len(f.Messages)),
 			Services:      make(orderedServices, 0, len(f.Services)),
 			Options:       mergeOptions(extractOptions(f.GetOptions()), extensions.Transform(f.OptionExtensions)),
+			FDS:           f,
 		}
 
-		for _, e := range f.Enums {
-			file.Enums = append(file.Enums, parseEnum(e))
+		pkg, ok := packagesByName[file.Package]
+		if !ok {
+			pkg = &Package{Name: file.Package}
+			packagesByName[file.Package] = pkg
+		}
+		if desc := strings.TrimSpace(file.Description); desc != "" {
+			pkg.Descriptions = append(pkg.Descriptions, &PackageDesc{
+				File:        file.Name,
+				Description: desc,
+			})
+		}
+
+		for i, e := range f.Enums {
+			file.Enums = append(file.Enums, parseEnum(f, []int32{5, int32(i)}, e))
 		}
 
 		for _, e := range f.Extensions {
@@ -49,22 +69,25 @@ func NewTemplate(descs []*protokit.FileDescriptor) *Template {
 		}
 
 		// Recursively add nested types from messages
-		var addFromMessage func(*protokit.Descriptor)
-		addFromMessage = func(m *protokit.Descriptor) {
-			file.Messages = append(file.Messages, parseMessage(m))
-			for _, e := range m.Enums {
-				file.Enums = append(file.Enums, parseEnum(e))
+		var addFromMessage func([]int32, *protokit.Descriptor)
+		addFromMessage = func(acc []int32, m *protokit.Descriptor) {
+			file.Messages = append(file.Messages, parseMessage(f, acc, m))
+			for j, e := range m.Enums {
+				file.Enums = append(file.Enums, parseEnum(f, append(acc, []int32{4, int32(j)}...), e))
 			}
-			for _, n := range m.Messages {
-				addFromMessage(n)
+			for j, n := range m.Messages {
+				addFromMessage(append(acc, []int32{3, int32(j)}...), n)
 			}
 		}
-		for _, m := range f.Messages {
-			addFromMessage(m)
+		for i, m := range f.Messages {
+			addFromMessage([]int32{4, int32(i)}, m)
+		}
+		for _, m := range file.Messages {
+			messagesByName[m.FullName] = m
 		}
 
-		for _, s := range f.Services {
-			file.Services = append(file.Services, parseService(s))
+		for i, s := range f.Services {
+			file.Services = append(file.Services, parseService(f, []int32{6, int32(i)}, s))
 		}
 
 		sort.Sort(file.Enums)
@@ -72,10 +95,71 @@ func NewTemplate(descs []*protokit.FileDescriptor) *Template {
 		sort.Sort(file.Messages)
 		sort.Sort(file.Services)
 
+		pkg.Services = append(pkg.Services, file.Services...)
+		pkg.Messages = append(pkg.Messages, file.Messages...)
+		pkg.Enums = append(pkg.Enums, file.Enums...)
+
 		files = append(files, file)
 	}
 
-	return &Template{Files: files, Scalars: makeScalars()}
+	res := &Template{Files: files, Scalars: makeScalars(), links: map[string]*Link{}}
+
+	for _, pkg := range packagesByName {
+		sort.Slice(pkg.Services, func(i, j int) bool {
+			return pkg.Services[i].FullName < pkg.Services[j].FullName
+		})
+		sort.Slice(pkg.Messages, func(i, j int) bool {
+			return pkg.Messages[i].FullName < pkg.Messages[j].FullName
+		})
+		sort.Slice(pkg.Enums, func(i, j int) bool {
+			return pkg.Enums[i].FullName < pkg.Enums[j].FullName
+		})
+
+		for _, msg := range pkg.Messages {
+			// links
+			res.links[msg.FullName] = &Link{
+				Package:  pkg.Name,
+				FullName: msg.FullName,
+			}
+
+			// maps
+			var fields []*MessageField
+			fields = append(fields, msg.Fields...)
+			for _, oneOf := range msg.OneOfs {
+				fields = append(fields, oneOf.Fields...)
+			}
+
+			for _, field := range fields {
+				if field.IsMap {
+					mType := messagesByName[field.FullType]
+					mType.Internal = true
+					for _, mtf := range mType.Fields {
+						if mtf.Name == "key" {
+							field.MapKeyType = mtf.FullType
+							continue
+						}
+						if mtf.Name == "value" {
+							field.MapValueType = mtf.FullType
+							continue
+						}
+					}
+				}
+			}
+		}
+		for _, enum := range pkg.Enums {
+			res.links[enum.FullName] = &Link{
+				Package:  pkg.Name,
+				FullName: enum.FullName,
+			}
+		}
+
+		res.Packages = append(res.Packages, pkg)
+	}
+	sort.Slice(res.Packages, func(i, j int) bool {
+		return res.Packages[i].Name < res.Packages[j].Name
+	})
+
+	return res
 }
 
 func makeScalars() []*ScalarValue {
@@ -120,6 +204,52 @@ func extractOptions(opts commonOptions) map[string]interface{} {
 	return out
 }
 
+type Link struct {
+	Package      string
+	FullName     string
+	External     bool
+	ExternalHREF string
+}
+
+type Package struct {
+	Name         string
+	Services     []*Service
+	Messages     []*Message
+	Enums        []*Enum
+	Descriptions []*PackageDesc
+}
+
+type PackageDesc struct {
+	File        string
+	Description string
+}
+
+type Source struct {
+	File             string
+	Path             []int32
+	Start            int32
+	End              int32
+	leadingComments  string
+	trailingComments string
+}
+
+func NewSource(f *protokit.FileDescriptor, acc []int32) *Source {
+	l := &Source{
+		File: f.GetName(),
+		Path: acc,
+	}
+	for _, loc := range f.SourceCodeInfo.GetLocation() {
+		if slices.Equal(loc.Path, acc) {
+			l.Start = loc.Span[0] + 1
+			l.End = loc.Span[2] + 1
+			l.leadingComments = strings.TrimSpace(loc.GetLeadingComments())
+			l.trailingComments = strings.TrimSpace(loc.GetTrailingComments())
+			break
+		}
+	}
+	return l
+}
+
 // File wraps all the relevant parsed info about a proto file. File objects guarantee that their top-level enums,
 // extensions, messages, and services are sorted alphabetically based on their "long name". Other values (enum values,
 // fields, service methods) will be in the order that they're defined within their respective proto files.
@@ -141,6 +271,8 @@ type File struct {
 	Services   orderedServices   `json:"services"`
 
 	Options map[string]interface{} `json:"options,omitempty"`
+
+	FDS *protokit.FileDescriptor
 }
 
 // Option returns the named option.
@@ -163,10 +295,18 @@ type FileExtension struct {
 	ContainingFullType string `json:"containingFullType"`
 }
 
+type OneOf struct {
+	Name        string
+	Description string
+	Fields      []*MessageField
+	Source      *Source
+}
+
 // Message contains details about a protobuf message.
 //
 // In the case of proto3 files, HasExtensions will always be false, and Extensions will be empty.
 type Message struct {
+	Internal    bool
 	Name        string `json:"name"`
 	LongName    string `json:"longName"`
 	FullName    string `json:"fullName"`
@@ -178,8 +318,11 @@ type Message struct {
 
 	Extensions []*MessageExtension `json:"extensions"`
 	Fields     []*MessageField     `json:"fields"`
+	OneOfs     []*OneOf
 
 	Options map[string]interface{} `json:"options,omitempty"`
+
+	Source *Source
 }
 
 // Option returns the named option.
@@ -224,6 +367,7 @@ func (m Message) FieldsWithOption(optionName string) []*MessageField {
 // In the case of proto3 files, DefaultValue will always be empty. Similarly, label will be empty unless the field is
 // repeated (in which case it'll be "repeated").
 type MessageField struct {
+	Index        int
 	Name         string `json:"name"`
 	Description  string `json:"description"`
 	Label        string `json:"label"`
@@ -231,6 +375,8 @@ type MessageField struct {
 	LongType     string `json:"longType"`
 	FullType     string `json:"fullType"`
 	IsMap        bool   `json:"ismap"`
+	MapKeyType   string
+	MapValueType string
 	IsOneof      bool   `json:"isoneof"`
 	OneofDecl    string `json:"oneofdecl"`
 	DefaultValue string `json:"defaultValue"`
@@ -259,6 +405,8 @@ type Enum struct {
 	Values      []*EnumValue `json:"values"`
 
 	Options map[string]interface{} `json:"options,omitempty"`
+
+	Source *Source
 }
 
 // Option returns the named option.
@@ -319,6 +467,8 @@ type Service struct {
 	Methods     []*ServiceMethod `json:"methods"`
 
 	Options map[string]interface{} `json:"options,omitempty"`
+
+	Source *Source
 }
 
 // Option returns the named option.
@@ -394,13 +544,14 @@ type ScalarValue struct {
 	RubyType   string `json:"rubyType"`
 }
 
-func parseEnum(pe *protokit.EnumDescriptor) *Enum {
+func parseEnum(f *protokit.FileDescriptor, acc []int32, pe *protokit.EnumDescriptor) *Enum {
 	enum := &Enum{
 		Name:        pe.GetName(),
 		LongName:    pe.GetLongName(),
 		FullName:    pe.GetFullName(),
 		Description: description(pe.GetComments().String()),
 		Options:     mergeOptions(extractOptions(pe.GetOptions()), extensions.Transform(pe.OptionExtensions)),
+		Source:      NewSource(f, acc),
 	}
 
 	for _, val := range pe.GetValues() {
@@ -435,7 +586,7 @@ func parseFileExtension(pe *protokit.ExtensionDescriptor) *FileExtension {
 	}
 }
 
-func parseMessage(pm *protokit.Descriptor) *Message {
+func parseMessage(f *protokit.FileDescriptor, acc []int32, pm *protokit.Descriptor) *Message {
 	msg := &Message{
 		Name:          pm.GetName(),
 		LongName:      pm.GetLongName(),
@@ -445,16 +596,37 @@ func parseMessage(pm *protokit.Descriptor) *Message {
 		HasFields:     len(pm.GetMessageFields()) > 0,
 		HasOneofs:     len(pm.GetOneofDecl()) > 0,
 		Extensions:    make([]*MessageExtension, 0, len(pm.Extensions)),
-		Fields:        make([]*MessageField, 0, len(pm.Fields)),
 		Options:       mergeOptions(extractOptions(pm.GetOptions()), extensions.Transform(pm.OptionExtensions)),
+		Source:        NewSource(f, acc),
 	}
 
 	for _, ext := range pm.Extensions {
 		msg.Extensions = append(msg.Extensions, parseMessageExtension(ext))
 	}
 
-	for _, f := range pm.Fields {
-		msg.Fields = append(msg.Fields, parseMessageField(f, pm.GetOneofDecl()))
+	var oneOfNames []string
+	oneOfs := map[string][]*MessageField{}
+	for _, fd := range pm.Fields {
+		field := parseMessageField(fd, pm.GetOneofDecl())
+		if field.Label != "optional" && field.IsOneof {
+			oneOfNames = append(oneOfNames, field.OneofDecl)
+			oneOfs[field.OneofDecl] = append(oneOfs[field.OneofDecl], field)
+			continue
+		}
+		msg.Fields = append(msg.Fields, field)
+	}
+	for i, oon := range slices.Compact(oneOfNames) {
+		oneOf := &OneOf{
+			Name:   oon,
+			Fields: oneOfs[oon],
+			Source: NewSource(f, append(acc, []int32{8, int32(i)}...)),
+		}
+		oneOf.Description = strings.TrimSpace(strings.Join(
+			[]string{
+				oneOf.Source.leadingComments,
+				oneOf.Source.trailingComments},
+			"\n\n"))
+		msg.OneOfs = append(msg.OneOfs, oneOf)
 	}
 
 	return msg
@@ -473,6 +645,7 @@ func parseMessageField(pf *protokit.FieldDescriptor, oneofDecls []*descriptor.On
 	t, lt, ft := parseType(pf)
 
 	m := &MessageField{
+		Index:        int(pf.FieldDescriptorProto.GetNumber()),
 		Name:         pf.GetName(),
 		Description:  description(pf.GetComments().String()),
 		Label:        labelName(pf.GetLabel(), pf.IsProto3(), pf.GetProto3Optional()),
@@ -502,13 +675,14 @@ func parseMessageField(pf *protokit.FieldDescriptor, oneofDecls []*descriptor.On
 	return m
 }
 
-func parseService(ps *protokit.ServiceDescriptor) *Service {
+func parseService(f *protokit.FileDescriptor, acc []int32, ps *protokit.ServiceDescriptor) *Service {
 	service := &Service{
 		Name:        ps.GetName(),
 		LongName:    ps.GetLongName(),
 		FullName:    ps.GetFullName(),
 		Description: description(ps.GetComments().String()),
 		Options:     mergeOptions(extractOptions(ps.GetOptions()), extensions.Transform(ps.OptionExtensions)),
+		Source:      NewSource(f, acc),
 	}
 
 	for _, sm := range ps.Methods {
