@@ -3,6 +3,8 @@ package gendoc
 import (
 	"encoding/json"
 	"fmt"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"slices"
 	"sort"
 	"strings"
@@ -11,6 +13,40 @@ import (
 	"github.com/pseudomuto/protoc-gen-doc/extensions"
 	"github.com/pseudomuto/protokit"
 )
+
+var scalarTypes = []string{
+	"double",
+	"float",
+	"int32",
+	"int64",
+	"uint32",
+	"uint64",
+	"sint32",
+	"sint64",
+	"fixed32",
+	"fixed64",
+	"sfixed32",
+	"sfixed64",
+	"bool",
+	"string",
+	"bytes",
+}
+
+var wellKnownTypes = map[string]string{
+	"Any":         "any",
+	"Api":         "api",
+	"BoolValue":   "bool-value",
+	"BytesValue":  "bytes-value",
+	"DoubleValue": "double-value",
+	"Duration":    "duration",
+	"Empty":       "empty",
+	"Enum":        "enum",
+	"EnumValue":   "enum-value",
+	"Field":       "field",
+	"Cardinality": "cardinality",
+	"Kind":        "kind",
+	"FieldMask":   "field-mask",
+}
 
 // Template is a type for encapsulating all the parsed files, messages, fields, enums, services, extensions, etc. into
 // an object that will be supplied to a go template.
@@ -65,7 +101,8 @@ func NewTemplate(descs []*protokit.FileDescriptor) *Template {
 		}
 
 		for _, e := range f.Extensions {
-			file.Extensions = append(file.Extensions, parseFileExtension(e))
+			ext := parseFileExtension(e)
+			file.Extensions = append(file.Extensions, ext)
 		}
 
 		// Recursively add nested types from messages
@@ -102,7 +139,11 @@ func NewTemplate(descs []*protokit.FileDescriptor) *Template {
 		files = append(files, file)
 	}
 
-	res := &Template{Files: files, Scalars: makeScalars(), links: map[string]*Link{}}
+	res := &Template{
+		Files:   files,
+		Scalars: makeScalars(),
+		links:   map[string]*Link{},
+	}
 
 	for _, pkg := range packagesByName {
 		sort.Slice(pkg.Services, func(i, j int) bool {
@@ -159,6 +200,13 @@ func NewTemplate(descs []*protokit.FileDescriptor) *Template {
 		return res.Packages[i].Name < res.Packages[j].Name
 	})
 
+	//for _, scalarType := range scalarTypes {
+	//	res.links[scalarType] = &Link{
+	//		External:     true,
+	//		ExternalHREF: "https://protobuf.dev/programming-guides/proto3/#scalar",
+	//	}
+	//}
+
 	return res
 }
 
@@ -190,9 +238,9 @@ type commonOptions interface {
 	GetDeprecated() bool
 }
 
-func extractOptions(opts commonOptions) map[string]interface{} {
+func extractOptions(opts protoreflect.ProtoMessage) map[string]interface{} {
 	out := make(map[string]interface{})
-	if opts.GetDeprecated() {
+	if opts.(commonOptions).GetDeprecated() {
 		out["deprecated"] = true
 	}
 	switch opts := opts.(type) {
@@ -201,6 +249,13 @@ func extractOptions(opts commonOptions) map[string]interface{} {
 			out["idempotency_level"] = opts.IdempotencyLevel.String()
 		}
 	}
+
+	extensionOptionsJson, _ := protojson.Marshal(opts)
+	extMap := make(map[string]interface{})
+	json.Unmarshal(extensionOptionsJson, &extMap)
+
+	out = mergeOptions(out, extMap)
+
 	return out
 }
 
