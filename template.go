@@ -239,7 +239,7 @@ type commonOptions interface {
 }
 
 func extractOptions(opts protoreflect.ProtoMessage) map[string]interface{} {
-	out := make(map[string]interface{})
+	out := make(map[string]any)
 	if opts.(commonOptions).GetDeprecated() {
 		out["deprecated"] = true
 	}
@@ -251,10 +251,15 @@ func extractOptions(opts protoreflect.ProtoMessage) map[string]interface{} {
 	}
 
 	extensionOptionsJson, _ := protojson.Marshal(opts)
-	extMap := make(map[string]interface{})
+	extMap := make(map[string]any)
 	json.Unmarshal(extensionOptionsJson, &extMap)
 
-	out = mergeOptions(out, extMap)
+	resMap := map[string]any{}
+	for k, v := range extMap {
+		resMap[strings.Trim(k, "[]")] = v
+	}
+
+	out = mergeOptions(out, resMap)
 
 	return out
 }
